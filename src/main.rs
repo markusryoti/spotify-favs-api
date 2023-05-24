@@ -6,13 +6,18 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
+
+extern crate redis;
 use redis::Connection;
+use redis::{Commands, ToRedisArgs};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{env, sync::Mutex};
 
 use tower_http::cors::CorsLayer;
+
+use uuid::Uuid;
 
 async fn root() -> &'static str {
     "Hello, World!"
@@ -44,14 +49,31 @@ impl IntoResponse for GetAccessTokenResponse {
     }
 }
 
+#[derive(Serialize)]
+enum SessionTokenResponse {
+    Ok(String),
+    Err(String),
+}
+
+impl IntoResponse for SessionTokenResponse {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            SessionTokenResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+            SessionTokenResponse::Err(err) => {
+                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
+            }
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct AccessTokenParams {
     code: String,
     state: String,
 }
 
-async fn access_token(
-    State(state): State<Arc<AppState>>,
+async fn create_session(
+    State(state): State<AppState>,
     params: Option<Query<AccessTokenParams>>,
 ) -> impl IntoResponse {
     if let Some(params) = params {
@@ -59,18 +81,23 @@ async fn access_token(
 
         let url = "https://accounts.spotify.com/api/token";
 
+        let client_id = &state.client_id;
+        let client_secret = &state.client_secret;
+
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            get_hashed_header(&state.client_id, &state.client_secret)
+            get_hashed_header(&client_id, &client_secret)
                 .parse()
                 .unwrap(),
         );
 
+        let redirect_uri = &state.redirect_uri;
+
         let mut form_params = HashMap::new();
         form_params.insert("grant_type", "authorization_code");
         form_params.insert("code", &params.code);
-        form_params.insert("redirect_uri", &state.redirect_uri);
+        form_params.insert("redirect_uri", &redirect_uri);
 
         let client = reqwest::Client::new();
         let res = client
@@ -91,7 +118,18 @@ async fn access_token(
                     serde_json::from_str(&body);
 
                 match token_response {
-                    Ok(res) => GetAccessTokenResponse::Ok(res),
+                    Ok(res) => {
+                        let session_id = Uuid::new_v4();
+
+                        let serialized = json!(&res).to_string();
+
+                        let mut con = state.redis_conn.lock().unwrap();
+                        let _: () = con.set(session_id.to_string(), &serialized).unwrap();
+
+                        println!("session saved, key: {} data: {}", session_id, serialized);
+
+                        GetAccessTokenResponse::Ok(res)
+                    }
                     Err(err) => GetAccessTokenResponse::Err(err.to_string()),
                 }
             }
@@ -108,8 +146,9 @@ fn get_hashed_header(client_id: &str, client_secret: &str) -> String {
     format!("Basic {}", base64_encoded)
 }
 
+#[derive(Clone)]
 struct AppState {
-    redis_conn: Connection,
+    redis_conn: Arc<Mutex<Connection>>,
     client_id: String,
     client_secret: String,
     redirect_uri: String,
@@ -135,18 +174,18 @@ async fn main() {
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
-    let shared_state = Arc::new(AppState {
-        redis_conn,
+    let shared_state = AppState {
+        redis_conn: Arc::new(Mutex::new(redis_conn)),
         client_id,
         client_secret,
         redirect_uri,
-    });
+    };
 
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/access-token", get(access_token))
+        .route("/create-session", get(create_session))
         .layer(cors)
         .with_state(shared_state);
 
