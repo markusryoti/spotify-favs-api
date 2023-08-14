@@ -9,6 +9,18 @@ services:
     volumes: 
       - redis:/data
 
+  db:
+    image: postgres:14
+    restart: always
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: devuser
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: spotify_favorites
+    volumes:
+      - ./db-data/:/var/lib/postgresql/data/
+
   api:
     build: .
     ports:
@@ -16,10 +28,14 @@ services:
     env_file:
       - .env
     depends_on:
+      - db
       - redis
     links:
+      - db
       - redis
 
 volumes:
   redis:
+    driver: local
+  db:
     driver: local

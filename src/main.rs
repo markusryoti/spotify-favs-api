@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use hyper::{body::Body, header::AUTHORIZATION, HeaderMap, Request, StatusCode};
 
 extern crate redis;
 use redis::Commands;
@@ -18,6 +18,10 @@ use std::{env, sync::Mutex};
 use tower_http::cors::CorsLayer;
 
 use uuid::Uuid;
+
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+
+mod db;
 
 async fn root() -> &'static str {
     "Hello, World!"
@@ -123,9 +127,17 @@ async fn create_session(
             SpotifyUserProfileResponse::Err(err) => return GetAccessTokenResponse::Err(err),
         };
 
-        let session_id = save_session(&user_info, &state);
+        // check if user exists, if not then create
+        let user_db_response = db::create_user(&state.postgres_pool, &user_info).await;
 
-        token_response.session = Some(session_id.to_string());
+        let user = match user_db_response {
+            Ok(u) => u,
+            Err(e) => return GetAccessTokenResponse::Err(e.to_string()),
+        };
+
+        save_session(&user, &state);
+
+        token_response.session = Some(user.id.to_string());
 
         GetAccessTokenResponse::Ok(token_response)
     } else {
@@ -250,16 +262,13 @@ async fn get_refreshed_token_body(response: reqwest::Response) -> GetRefreshedAc
     }
 }
 
-fn save_session(token_res: &SpotifyUserProfile, state: &AppState) -> Uuid {
-    let session_id = Uuid::new_v4();
-    let serialized = json!(token_res).to_string();
+fn save_session(user: &db::SpotifyUser, state: &AppState) {
+    let serialized = json!(user).to_string();
 
     let mut con = state.redis_conn.lock().unwrap();
-    let _: () = con.set(session_id.to_string(), &serialized).unwrap();
+    let _: () = con.set(user.id, &serialized).unwrap();
 
-    println!("session saved, key: {} data: {}", session_id, serialized);
-
-    session_id
+    println!("session saved, key: {} data: {}", user.id, serialized);
 }
 
 fn get_hashed_header(client_id: &str, client_secret: &str) -> String {
@@ -303,16 +312,79 @@ enum SpotifyUserProfileResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct SpotifyUserProfile {
+pub struct SpotifyUserProfile {
     country: String,
     display_name: String,
     email: String,
     id: String,
 }
 
+async fn add_room(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let token = get_token(headers);
+
+    if !token.is_some() {
+        return AddRoomResponse::Err("unauthorized".to_string());
+    }
+
+    println!("auth token: {}", token.unwrap());
+
+    let _room = db::Room {
+        id: 1,
+        name: "".to_string(),
+        owner: 1,
+        created_at: "".to_string(),
+    };
+
+    AddRoomResponse::Ok("".to_string())
+}
+
+fn get_token(headers: HeaderMap) -> Option<String> {
+    let auth_header = headers.get(AUTHORIZATION);
+
+    if let Some(val) = auth_header {
+        let s = val.to_str();
+
+        if let Ok(s) = s {
+            let token = s.split(" ").nth(1);
+
+            if let Some(t) = token {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+#[derive(Serialize)]
+enum AddRoomResponse {
+    Ok(String),
+    Err(String),
+}
+
+impl IntoResponse for AddRoomResponse {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AddRoomResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+            AddRoomResponse::Err(err) => {
+                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     redis_conn: Arc<Mutex<Connection>>,
+    postgres_pool: Pool<Postgres>,
     client_id: String,
     client_secret: String,
     redirect_uri: String,
@@ -334,12 +406,19 @@ async fn main() {
         }
     };
 
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect("postgres://devuser:devpassword@db:5432/spotify_favorites")
+        .await
+        .unwrap();
+
     let client_id = env::var("CLIENT_ID").unwrap();
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
     let shared_state = AppState {
         redis_conn: Arc::new(Mutex::new(redis_conn)),
+        postgres_pool: pool,
         client_id,
         client_secret,
         redirect_uri,
@@ -351,6 +430,7 @@ async fn main() {
         .route("/", get(root))
         .route("/create-session", get(create_session))
         .route("/refresh-token", post(refresh_token))
+        .route("/add-room", post(add_room))
         .layer(cors)
         .with_state(shared_state);
 
