@@ -4,24 +4,21 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose, Engine as _};
-use hyper::{body::Body, header::AUTHORIZATION, HeaderMap, Request, StatusCode};
 
-extern crate redis;
-use redis::Commands;
-use redis::Connection;
+use base64::{engine::general_purpose, Engine as _};
+use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use std::{env, sync::Mutex};
+use std::env;
+use std::{collections::HashMap, net::SocketAddr};
 
 use tower_http::cors::CorsLayer;
-
-use uuid::Uuid;
 
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 
 mod db;
+mod jwt;
 
 async fn root() -> &'static str {
     "Hello, World!"
@@ -47,9 +44,11 @@ impl IntoResponse for GetAccessTokenResponse {
     fn into_response(self) -> axum::response::Response {
         match self {
             GetAccessTokenResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            GetAccessTokenResponse::Err(err) => {
-                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
-            }
+            GetAccessTokenResponse::Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err })),
+            )
+                .into_response(),
         }
     }
 }
@@ -74,9 +73,11 @@ impl IntoResponse for GetRefreshedAccessTokenResponse {
             GetRefreshedAccessTokenResponse::Ok(result) => {
                 (StatusCode::OK, Json(result)).into_response()
             }
-            GetRefreshedAccessTokenResponse::Err(err) => {
-                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
-            }
+            GetRefreshedAccessTokenResponse::Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err })),
+            )
+                .into_response(),
         }
     }
 }
@@ -91,9 +92,11 @@ impl IntoResponse for SessionTokenResponse {
     fn into_response(self) -> axum::response::Response {
         match self {
             SessionTokenResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            SessionTokenResponse::Err(err) => {
-                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
-            }
+            SessionTokenResponse::Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err })),
+            )
+                .into_response(),
         }
     }
 }
@@ -114,35 +117,51 @@ async fn create_session(
         let mut token_response = match get_tokens(&state, params).await {
             Ok(response) => match get_token_body(response).await {
                 GetAccessTokenResponse::Ok(token_res) => token_res,
-                GetAccessTokenResponse::Err(e) => return GetAccessTokenResponse::Err(e),
+                GetAccessTokenResponse::Err(e) => {
+                    return GetAccessTokenResponse::Err(e).into_response()
+                }
             },
-            Err(err) => return GetAccessTokenResponse::Err(err.to_string()),
+            Err(err) => return GetAccessTokenResponse::Err(err.to_string()).into_response(),
         };
 
         // Get user information with the new access token and save profile data
         let user_info = get_user_info(token_response.access_token.to_owned()).await;
-
         let user_info = match user_info {
             SpotifyUserProfileResponse::Ok(info) => info,
-            SpotifyUserProfileResponse::Err(err) => return GetAccessTokenResponse::Err(err),
+            SpotifyUserProfileResponse::Err(err) => {
+                return GetAccessTokenResponse::Err(err).into_response()
+            }
         };
 
         // check if user exists, if not then create
         let user_db_response = db::create_user(&state.postgres_pool, &user_info).await;
-
         let user = match user_db_response {
             Ok(u) => u,
-            Err(e) => return GetAccessTokenResponse::Err(e.to_string()),
+            Err(e) => return GetAccessTokenResponse::Err(e.to_string()).into_response(),
         };
 
-        save_session(&user, &state);
+        let token_result = generate_jwt(&user);
+        let token = match token_result {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
 
-        token_response.session = Some(user.id.to_string());
+        token_response.session = Some(token);
 
-        GetAccessTokenResponse::Ok(token_response)
+        GetAccessTokenResponse::Ok(token_response).into_response()
     } else {
-        GetAccessTokenResponse::Err("invalid request".to_string())
+        GetAccessTokenResponse::Err("invalid request".to_string()).into_response()
     }
+}
+
+fn generate_jwt(user: &db::SpotifyUser) -> Result<String, jwt::AuthError> {
+    let claims = jwt::Claims {
+        sub: user.id.unwrap().to_string(),
+        display_name: user.display_name.to_string(),
+        exp: 2000000000,
+    };
+
+    jwt::encode_claims(claims)
 }
 
 #[derive(Deserialize)]
@@ -262,15 +281,6 @@ async fn get_refreshed_token_body(response: reqwest::Response) -> GetRefreshedAc
     }
 }
 
-fn save_session(user: &db::SpotifyUser, state: &AppState) {
-    let serialized = json!(user).to_string();
-
-    let mut con = state.redis_conn.lock().unwrap();
-    let _: () = con.set(user.id, &serialized).unwrap();
-
-    println!("session saved, key: {} data: {}", user.id, serialized);
-}
-
 fn get_hashed_header(client_id: &str, client_secret: &str) -> String {
     let plain = format!("{}:{}", client_id, client_secret);
     let base64_encoded = general_purpose::STANDARD_NO_PAD.encode(plain.as_bytes());
@@ -320,53 +330,42 @@ pub struct SpotifyUserProfile {
 }
 
 async fn add_room(
-    headers: HeaderMap,
     State(state): State<AppState>,
-    req: Request<Body>,
+    claims: jwt::Claims,
+    Json(payload): Json<AddRoomRequest>,
 ) -> impl IntoResponse {
-    let token = get_token(headers);
+    let user_id = claims.sub;
+    let user_uid = db::parse_uuid(&user_id);
 
-    if !token.is_some() {
-        return AddRoomResponse::Err("unauthorized".to_string());
+    if user_uid.is_err() {
+        return AddRoomResponse::Err("error converting user id to uuid".to_string());
     }
 
-    println!("auth token: {}", token.unwrap());
+    let user_uid = user_uid.unwrap();
 
-    let _room = db::Room {
-        id: 1,
-        name: "".to_string(),
-        owner: 1,
-        created_at: "".to_string(),
+    let room = db::Room {
+        id: None,
+        name: payload.room_name,
+        owner: user_uid,
+        created_at: None,
     };
 
-    AddRoomResponse::Ok("".to_string())
+    let res = db::add_room(&state.postgres_pool, &room).await;
+
+    match res {
+        Ok(room) => AddRoomResponse::Ok(room),
+        Err(e) => AddRoomResponse::Err(e.to_string()),
+    }
 }
 
-fn get_token(headers: HeaderMap) -> Option<String> {
-    let auth_header = headers.get(AUTHORIZATION);
-
-    if let Some(val) = auth_header {
-        let s = val.to_str();
-
-        if let Ok(s) = s {
-            let token = s.split(" ").nth(1);
-
-            if let Some(t) = token {
-                Some(t.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+#[derive(Deserialize)]
+struct AddRoomRequest {
+    room_name: String,
 }
 
 #[derive(Serialize)]
 enum AddRoomResponse {
-    Ok(String),
+    Ok(db::Room),
     Err(String),
 }
 
@@ -374,16 +373,17 @@ impl IntoResponse for AddRoomResponse {
     fn into_response(self) -> axum::response::Response {
         match self {
             AddRoomResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            AddRoomResponse::Err(err) => {
-                (StatusCode::UNAUTHORIZED, Json(json!({ "error": err }))).into_response()
-            }
+            AddRoomResponse::Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err })),
+            )
+                .into_response(),
         }
     }
 }
 
 #[derive(Clone)]
 struct AppState {
-    redis_conn: Arc<Mutex<Connection>>,
     postgres_pool: Pool<Postgres>,
     client_id: String,
     client_secret: String,
@@ -392,20 +392,6 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let client = redis::Client::open("redis://redis").unwrap();
-
-    let con = client.get_connection();
-
-    let redis_conn = match con {
-        Ok(c) => {
-            println!("redis connection ok");
-            c
-        }
-        Err(err) => {
-            panic!("error connecting to redis: {}", err);
-        }
-    };
-
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect("postgres://devuser:devpassword@db:5432/spotify_favorites")
@@ -417,7 +403,6 @@ async fn main() {
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
     let shared_state = AppState {
-        redis_conn: Arc::new(Mutex::new(redis_conn)),
         postgres_pool: pool,
         client_id,
         client_secret,
