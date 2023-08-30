@@ -6,11 +6,11 @@ use sqlx::Postgres;
 
 use sqlx::{postgres::PgPoolOptions, Pool};
 
-pub struct Db {
+pub struct Client {
     pool: Pool<Postgres>,
 }
 
-impl Db {
+impl Client {
     pub async fn new() -> Self {
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -18,7 +18,7 @@ impl Db {
             .await
             .unwrap();
 
-        Db { pool }
+        Client { pool }
     }
 
     pub fn conn(self) -> Pool<Postgres> {

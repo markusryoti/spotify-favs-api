@@ -15,7 +15,7 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use tower_http::cors::CorsLayer;
 
-use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use sqlx::{Pool, Postgres};
 
 mod db;
 mod jwt;
@@ -104,7 +104,8 @@ async fn create_session(
         };
 
         // check if user exists, if not then create
-        let user_db_response = db::create_user(&state.postgres_pool, &user_info).await;
+        let user_db_response: Result<db::SpotifyUser, sqlx::Error> =
+            db::create_user(&state.db_pool, &user_info).await;
         let user = match user_db_response {
             Ok(u) => u,
             Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -299,6 +300,11 @@ pub struct SpotifyUserProfile {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct AddRoomRequest {
+    room_name: String,
+}
+
 async fn add_room(
     State(state): State<AppState>,
     claims: jwt::Claims,
@@ -323,7 +329,7 @@ async fn add_room(
         created_at: None,
     };
 
-    let res = db::add_room(&state.postgres_pool, &room).await;
+    let res = db::add_room(&state.db_pool, &room).await;
 
     match res {
         Ok(room) => ServerResponse::Ok(room),
@@ -334,7 +340,7 @@ async fn add_room(
 async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> impl IntoResponse {
     let user_id = claims.sub;
 
-    let rooms = db::get_rooms_by_user(&state.postgres_pool, &user_id).await;
+    let rooms = db::get_rooms_by_user(&state.db_pool, &user_id).await;
 
     match rooms {
         Ok(rooms) => ServerResponse::Ok(rooms),
@@ -342,14 +348,9 @@ async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> im
     }
 }
 
-#[derive(Deserialize)]
-struct AddRoomRequest {
-    room_name: String,
-}
-
 #[derive(Clone)]
 struct AppState {
-    postgres_pool: Pool<Postgres>,
+    db_pool: Pool<Postgres>,
     client_id: String,
     client_secret: String,
     redirect_uri: String,
@@ -357,14 +358,14 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let pg_db = db::Db::new().await;
+    let pg_db = db::Client::new().await;
 
     let client_id = env::var("CLIENT_ID").unwrap();
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
     let shared_state = AppState {
-        postgres_pool: pg_db.conn(),
+        db_pool: pg_db.conn(),
         client_id,
         client_secret,
         redirect_uri,
