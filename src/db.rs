@@ -4,6 +4,28 @@ use sqlx::types::uuid;
 use sqlx::types::uuid::Uuid;
 use sqlx::Postgres;
 
+use sqlx::{postgres::PgPoolOptions, Pool};
+
+pub struct Db {
+    pool: Pool<Postgres>,
+}
+
+impl Db {
+    pub async fn new() -> Self {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect("postgres://devuser:devpassword@db:5432/spotify_favorites")
+            .await
+            .unwrap();
+
+        Db { pool }
+    }
+
+    pub fn conn(self) -> Pool<Postgres> {
+        self.pool
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct SpotifyUser {
     pub id: Option<Uuid>,
@@ -18,6 +40,20 @@ pub struct Room {
     pub owner: Uuid,
     pub name: String,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub enum DbErr {
+    Call(sqlx::Error),
+    Uuid(uuid::Error),
+}
+
+impl DbErr {
+    pub fn msg(self) -> String {
+        match self {
+            DbErr::Call(e) => e.to_string(),
+            DbErr::Uuid(e) => e.to_string(),
+        }
+    }
 }
 
 pub async fn create_user(
@@ -152,14 +188,26 @@ async fn get_room_with_name_and_user(
     }
 }
 
-async fn get_rooms_by_user(
+pub async fn get_rooms_by_user(
     pool: &sqlx::Pool<Postgres>,
-    user_id: &Uuid,
-) -> Result<Vec<Room>, sqlx::Error> {
+    user_id: &str,
+) -> Result<Vec<Room>, DbErr> {
+    let uuid = parse_uuid(user_id);
+
+    let uuid = match uuid {
+        Ok(id) => id,
+        Err(e) => return Err(DbErr::Uuid(e)),
+    };
+
     let stream = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE owner = $1")
-        .bind(user_id)
+        .bind(uuid)
         .fetch_all(pool)
-        .await?;
+        .await;
+
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => return Err(DbErr::Call(e)),
+    };
 
     let rooms: Vec<Room> = stream.into_iter().collect();
 

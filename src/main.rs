@@ -88,8 +88,8 @@ async fn create_session(
 
         let mut token_response = match get_tokens(&state, params).await {
             Ok(response) => match get_token_body(response).await {
-                ServerResponse::Ok(token_res) => token_res,
-                ServerResponse::Err(status, e) => return ServerResponse::Err(status, e),
+                Ok(token_res) => token_res,
+                Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
             },
             Err(err) => {
                 return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -191,18 +191,20 @@ async fn get_tokens(
         .await
 }
 
-async fn get_token_body(response: reqwest::Response) -> ServerResponse<SpotifyAccessTokenResponse> {
+async fn get_token_body(
+    response: reqwest::Response,
+) -> Result<SpotifyAccessTokenResponse, ParseError> {
     let body = match response.text().await {
         Ok(b) => b,
-        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return Err(ParseError::Err(e.to_string())),
     };
 
     let deserialized: Result<SpotifyAccessTokenResponse, serde_json::Error> =
         serde_json::from_str(&body);
 
     match deserialized {
-        Ok(res) => ServerResponse::Ok(res),
-        Err(err) => ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Ok(res) => Ok(res),
+        Err(err) => Err(ParseError::Err(err.to_string())),
     }
 }
 
@@ -329,16 +331,16 @@ async fn add_room(
     }
 }
 
-// async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> impl IntoResponse {
-//     let user_id = claims.sub;
-//     let user_uid = db::parse_uuid(&user_id);
+async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> impl IntoResponse {
+    let user_id = claims.sub;
 
-//     if user_uid.is_err() {
-//         return AddRoomResponse::Err("error converting user id to uuid".to_string());
-//     }
+    let rooms = db::get_rooms_by_user(&state.postgres_pool, &user_id).await;
 
-//     let user_uid = user_uid.unwrap();
-// }
+    match rooms {
+        Ok(rooms) => ServerResponse::Ok(rooms),
+        Err(e) => ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
+    }
+}
 
 #[derive(Deserialize)]
 struct AddRoomRequest {
@@ -355,18 +357,14 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect("postgres://devuser:devpassword@db:5432/spotify_favorites")
-        .await
-        .unwrap();
+    let pg_db = db::Db::new().await;
 
     let client_id = env::var("CLIENT_ID").unwrap();
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
     let shared_state = AppState {
-        postgres_pool: pool,
+        postgres_pool: pg_db.conn(),
         client_id,
         client_secret,
         redirect_uri,
@@ -379,7 +377,7 @@ async fn main() {
         .route("/create-session", get(create_session))
         .route("/refresh-token", post(refresh_token))
         .route("/add-room", post(add_room))
-        // .route("/users/rooms/:id", get(rooms_by_user))
+        .route("/rooms", get(rooms_by_user))
         .layer(cors)
         .with_state(shared_state);
 
