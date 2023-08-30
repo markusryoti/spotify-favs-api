@@ -83,14 +83,14 @@ pub fn parse_uuid(uuid_str: &str) -> Result<Uuid, uuid::Error> {
 }
 
 pub async fn add_room(pool: &sqlx::Pool<Postgres>, room: &Room) -> Result<Room, sqlx::Error> {
-    let existing_result = get_room_with_name(pool, &room.name).await?;
+    let existing_result = get_room_with_name_and_user(pool, &room.owner, &room.name).await?;
 
     if let Some(existing_room) = existing_result {
         Ok(existing_room)
     } else {
         insert_room(pool, &room).await?;
 
-        let room = get_room_with_name(pool, &room.name).await?;
+        let room = get_room_with_name_and_user(pool, &room.owner, &room.name).await?;
 
         if let Some(u) = room {
             Ok(u)
@@ -114,24 +114,6 @@ async fn insert_room(pool: &sqlx::Pool<Postgres>, room: &Room) -> Result<(), sql
     Ok(())
 }
 
-async fn get_room_with_name(
-    pool: &sqlx::Pool<Postgres>,
-    room_name: &str,
-) -> Result<Option<Room>, sqlx::Error> {
-    let res = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE name = $1")
-        .bind(room_name)
-        .fetch_optional(pool)
-        .await?;
-
-    if let Some(room) = res {
-        println!("Found room: {:?}", room);
-        Ok(Some(room))
-    } else {
-        println!("Didn't find room with name: {}", room_name);
-        Ok(None)
-    }
-}
-
 async fn get_room(
     pool: &sqlx::Pool<Postgres>,
     room_id: &Uuid,
@@ -148,4 +130,38 @@ async fn get_room(
         println!("Didn't find room with id: {}", room_id);
         Ok(None)
     }
+}
+
+async fn get_room_with_name_and_user(
+    pool: &sqlx::Pool<Postgres>,
+    user_id: &Uuid,
+    room_name: &str,
+) -> Result<Option<Room>, sqlx::Error> {
+    let res = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE owner = $1 AND name = $2")
+        .bind(user_id)
+        .bind(room_name)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some(room) = res {
+        println!("Found room: {:?}", room);
+        Ok(Some(room))
+    } else {
+        println!("Didn't find room with name: {}", room_name);
+        Ok(None)
+    }
+}
+
+async fn get_rooms_by_user(
+    pool: &sqlx::Pool<Postgres>,
+    user_id: &Uuid,
+) -> Result<Vec<Room>, sqlx::Error> {
+    let stream = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE owner = $1")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+    let rooms: Vec<Room> = stream.into_iter().collect();
+
+    Ok(rooms)
 }

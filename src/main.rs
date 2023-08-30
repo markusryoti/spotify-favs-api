@@ -20,14 +20,39 @@ use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 mod db;
 mod jwt;
 
-async fn root() -> &'static str {
-    "Hello, World!"
+enum ServerResponse<T> {
+    Ok(T),
+    Err(StatusCode, String),
 }
 
-#[derive(Serialize)]
-enum GetAccessTokenResponse {
-    Ok(SpotifyAccessTokenResponse),
+impl<T> IntoResponse for ServerResponse<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ServerResponse::Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+            ServerResponse::Err(status, err) => {
+                (status, Json(json!({ "error": err }))).into_response()
+            }
+        }
+    }
+}
+
+enum ParseError {
     Err(String),
+}
+
+impl ParseError {
+    fn msg(self) -> String {
+        match self {
+            ParseError::Err(e) => e,
+        }
+    }
+}
+
+async fn root() -> &'static str {
+    "Hello, World!"
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -40,25 +65,6 @@ struct SpotifyAccessTokenResponse {
     session: Option<String>, // added in the api
 }
 
-impl IntoResponse for GetAccessTokenResponse {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            GetAccessTokenResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            GetAccessTokenResponse::Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err })),
-            )
-                .into_response(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-enum GetRefreshedAccessTokenResponse {
-    Ok(SpotifyRefreshedAccessTokenResponse),
-    Err(String),
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 struct SpotifyRefreshedAccessTokenResponse {
     access_token: String,
@@ -67,41 +73,7 @@ struct SpotifyRefreshedAccessTokenResponse {
     expires_in: i32,
 }
 
-impl IntoResponse for GetRefreshedAccessTokenResponse {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            GetRefreshedAccessTokenResponse::Ok(result) => {
-                (StatusCode::OK, Json(result)).into_response()
-            }
-            GetRefreshedAccessTokenResponse::Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err })),
-            )
-                .into_response(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-enum SessionTokenResponse {
-    Ok(String),
-    Err(String),
-}
-
-impl IntoResponse for SessionTokenResponse {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            SessionTokenResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            SessionTokenResponse::Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err })),
-            )
-                .into_response(),
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct AccessTokenParams {
     code: String,
     state: String,
@@ -116,41 +88,42 @@ async fn create_session(
 
         let mut token_response = match get_tokens(&state, params).await {
             Ok(response) => match get_token_body(response).await {
-                GetAccessTokenResponse::Ok(token_res) => token_res,
-                GetAccessTokenResponse::Err(e) => {
-                    return GetAccessTokenResponse::Err(e).into_response()
-                }
+                ServerResponse::Ok(token_res) => token_res,
+                ServerResponse::Err(status, e) => return ServerResponse::Err(status, e),
             },
-            Err(err) => return GetAccessTokenResponse::Err(err.to_string()).into_response(),
+            Err(err) => {
+                return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            }
         };
 
         // Get user information with the new access token and save profile data
         let user_info = get_user_info(token_response.access_token.to_owned()).await;
         let user_info = match user_info {
-            SpotifyUserProfileResponse::Ok(info) => info,
-            SpotifyUserProfileResponse::Err(err) => {
-                return GetAccessTokenResponse::Err(err).into_response()
-            }
+            Ok(info) => info,
+            Err(err) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.msg()),
         };
 
         // check if user exists, if not then create
         let user_db_response = db::create_user(&state.postgres_pool, &user_info).await;
         let user = match user_db_response {
             Ok(u) => u,
-            Err(e) => return GetAccessTokenResponse::Err(e.to_string()).into_response(),
+            Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
 
         let token_result = generate_jwt(&user);
         let token = match token_result {
             Ok(t) => t,
-            Err(e) => return e.into_response(),
+            Err(e) => {
+                let values = e.get_error_values();
+                return ServerResponse::Err(values.0, values.1);
+            }
         };
 
         token_response.session = Some(token);
 
-        GetAccessTokenResponse::Ok(token_response).into_response()
+        ServerResponse::Ok(token_response)
     } else {
-        GetAccessTokenResponse::Err("invalid request".to_string()).into_response()
+        ServerResponse::Err(StatusCode::BAD_REQUEST, "invalid request".to_string())
     }
 }
 
@@ -175,15 +148,13 @@ async fn refresh_token(
 ) -> impl IntoResponse {
     let token_response = match get_refreshed_token(&state, payload.refresh_token).await {
         Ok(res) => match get_refreshed_token_body(res).await {
-            GetRefreshedAccessTokenResponse::Ok(res) => res,
-            GetRefreshedAccessTokenResponse::Err(e) => {
-                return GetRefreshedAccessTokenResponse::Err(e)
-            }
+            Ok(res) => res,
+            Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
         },
-        Err(e) => return GetRefreshedAccessTokenResponse::Err(e.to_string()),
+        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    GetRefreshedAccessTokenResponse::Ok(token_response)
+    ServerResponse::Ok(token_response)
 }
 
 async fn get_tokens(
@@ -220,18 +191,18 @@ async fn get_tokens(
         .await
 }
 
-async fn get_token_body(response: reqwest::Response) -> GetAccessTokenResponse {
+async fn get_token_body(response: reqwest::Response) -> ServerResponse<SpotifyAccessTokenResponse> {
     let body = match response.text().await {
         Ok(b) => b,
-        Err(e) => return GetAccessTokenResponse::Err(e.to_string()),
+        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     let deserialized: Result<SpotifyAccessTokenResponse, serde_json::Error> =
         serde_json::from_str(&body);
 
     match deserialized {
-        Ok(res) => GetAccessTokenResponse::Ok(res),
-        Err(err) => GetAccessTokenResponse::Err(err.to_string()),
+        Ok(res) => ServerResponse::Ok(res),
+        Err(err) => ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 
@@ -266,18 +237,20 @@ async fn get_refreshed_token(
         .await
 }
 
-async fn get_refreshed_token_body(response: reqwest::Response) -> GetRefreshedAccessTokenResponse {
+async fn get_refreshed_token_body(
+    response: reqwest::Response,
+) -> Result<SpotifyRefreshedAccessTokenResponse, ParseError> {
     let body = match response.text().await {
         Ok(b) => b,
-        Err(e) => return GetRefreshedAccessTokenResponse::Err(e.to_string()),
+        Err(e) => return Err(ParseError::Err(e.to_string())),
     };
 
     let deserialized: Result<SpotifyRefreshedAccessTokenResponse, serde_json::Error> =
         serde_json::from_str(&body);
 
     match deserialized {
-        Ok(res) => GetRefreshedAccessTokenResponse::Ok(res),
-        Err(err) => GetRefreshedAccessTokenResponse::Err(err.to_string()),
+        Ok(res) => Ok(res),
+        Err(err) => Err(ParseError::Err(err.to_string())),
     }
 }
 
@@ -287,7 +260,7 @@ fn get_hashed_header(client_id: &str, client_secret: &str) -> String {
     format!("Basic {}", base64_encoded)
 }
 
-async fn get_user_info(token: String) -> SpotifyUserProfileResponse {
+async fn get_user_info(token: String) -> Result<SpotifyUserProfile, ParseError> {
     let url = "https://api.spotify.com/v1/me";
 
     let mut headers = HeaderMap::new();
@@ -300,9 +273,9 @@ async fn get_user_info(token: String) -> SpotifyUserProfileResponse {
     let body = match result {
         Ok(res) => match res.text().await {
             Ok(body) => body,
-            Err(err) => return SpotifyUserProfileResponse::Err(err.to_string()),
+            Err(err) => return Err(ParseError::Err(err.to_string())),
         },
-        Err(err) => return SpotifyUserProfileResponse::Err(err.to_string()),
+        Err(err) => return Err(ParseError::Err(err.to_string())),
     };
 
     let parse_result: Result<SpotifyUserProfile, serde_json::Error> = serde_json::from_str(&body);
@@ -310,15 +283,10 @@ async fn get_user_info(token: String) -> SpotifyUserProfileResponse {
     match parse_result {
         Ok(profile) => {
             println!("{:?}", profile);
-            SpotifyUserProfileResponse::Ok(profile)
+            Ok(profile)
         }
-        Err(err) => SpotifyUserProfileResponse::Err(err.to_string()),
+        Err(err) => Err(ParseError::Err(err.to_string())),
     }
-}
-
-enum SpotifyUserProfileResponse {
-    Ok(SpotifyUserProfile),
-    Err(String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -338,7 +306,10 @@ async fn add_room(
     let user_uid = db::parse_uuid(&user_id);
 
     if user_uid.is_err() {
-        return AddRoomResponse::Err("error converting user id to uuid".to_string());
+        return ServerResponse::Err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "error converting user id to uuid".to_string(),
+        );
     }
 
     let user_uid = user_uid.unwrap();
@@ -353,33 +324,25 @@ async fn add_room(
     let res = db::add_room(&state.postgres_pool, &room).await;
 
     match res {
-        Ok(room) => AddRoomResponse::Ok(room),
-        Err(e) => AddRoomResponse::Err(e.to_string()),
+        Ok(room) => ServerResponse::Ok(room),
+        Err(e) => ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
+
+// async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> impl IntoResponse {
+//     let user_id = claims.sub;
+//     let user_uid = db::parse_uuid(&user_id);
+
+//     if user_uid.is_err() {
+//         return AddRoomResponse::Err("error converting user id to uuid".to_string());
+//     }
+
+//     let user_uid = user_uid.unwrap();
+// }
 
 #[derive(Deserialize)]
 struct AddRoomRequest {
     room_name: String,
-}
-
-#[derive(Serialize)]
-enum AddRoomResponse {
-    Ok(db::Room),
-    Err(String),
-}
-
-impl IntoResponse for AddRoomResponse {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            AddRoomResponse::Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-            AddRoomResponse::Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": err })),
-            )
-                .into_response(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -416,6 +379,7 @@ async fn main() {
         .route("/create-session", get(create_session))
         .route("/refresh-token", post(refresh_token))
         .route("/add-room", post(add_room))
+        // .route("/users/rooms/:id", get(rooms_by_user))
         .layer(cors)
         .with_state(shared_state);
 

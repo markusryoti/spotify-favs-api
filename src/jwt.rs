@@ -17,13 +17,11 @@ static KEYS: Lazy<Keys> = Lazy::new(|| {
     Keys::new(secret.as_bytes())
 });
 
-impl AuthBody {
-    fn new(access_token: String) -> Self {
-        Self {
-            access_token,
-            token_type: "Bearer".to_string(),
-        }
-    }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: String, // user id
+    pub display_name: String,
+    pub exp: usize,
 }
 
 #[async_trait]
@@ -46,6 +44,14 @@ where
     }
 }
 
+#[derive(Debug)]
+pub enum AuthError {
+    WrongCredentials,
+    MissingCredentials,
+    TokenCreation,
+    InvalidToken,
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, error_message) = match self {
@@ -58,6 +64,19 @@ impl IntoResponse for AuthError {
             "error": error_message,
         }));
         (status, body).into_response()
+    }
+}
+
+impl AuthError {
+    pub fn get_error_values(self) -> (StatusCode, String) {
+        let (status, error_message) = match self {
+            AuthError::WrongCredentials => (StatusCode::UNAUTHORIZED, "Wrong credentials"),
+            AuthError::MissingCredentials => (StatusCode::BAD_REQUEST, "Missing credentials"),
+            AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation error"),
+            AuthError::InvalidToken => (StatusCode::BAD_REQUEST, "Invalid token"),
+        };
+
+        (status, error_message.to_string())
     }
 }
 
@@ -77,31 +96,4 @@ impl Keys {
 
 pub fn encode_claims(claims: Claims) -> Result<String, AuthError> {
     encode(&Header::default(), &claims, &KEYS.encoding).map_err(|_| AuthError::TokenCreation)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: String, // user id
-    pub display_name: String,
-    pub exp: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct AuthBody {
-    access_token: String,
-    token_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuthPayload {
-    client_id: String,
-    client_secret: String,
-}
-
-#[derive(Debug)]
-pub enum AuthError {
-    WrongCredentials,
-    MissingCredentials,
-    TokenCreation,
-    InvalidToken,
 }
