@@ -42,6 +42,7 @@ pub struct Room {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[derive(Debug)]
 pub enum DbErr {
     Call(sqlx::Error),
     Uuid(uuid::Error),
@@ -150,16 +151,25 @@ async fn insert_room(pool: &sqlx::Pool<Postgres>, room: &Room) -> Result<(), sql
     Ok(())
 }
 
-async fn get_room(
-    pool: &sqlx::Pool<Postgres>,
-    room_id: &Uuid,
-) -> Result<Option<Room>, sqlx::Error> {
-    let res = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE id = $1")
-        .bind(room_id)
-        .fetch_optional(pool)
-        .await?;
+pub async fn get_room(pool: &sqlx::Pool<Postgres>, room_id: &str) -> Result<Option<Room>, DbErr> {
+    let uuid = parse_uuid(room_id);
 
-    if let Some(room) = res {
+    let uuid = match uuid {
+        Ok(id) => id,
+        Err(e) => return Err(DbErr::Uuid(e)),
+    };
+
+    let res = sqlx::query_as::<_, Room>("SELECT * FROM room WHERE id = $1")
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await;
+
+    let room = match res {
+        Ok(room_opt) => room_opt,
+        Err(e) => return Err(DbErr::Call(e)),
+    };
+
+    if let Some(room) = room {
         println!("Found room: {:?}", room);
         Ok(Some(room))
     } else {

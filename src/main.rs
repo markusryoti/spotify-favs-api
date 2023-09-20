@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Query, State},
-    response::IntoResponse,
+    extract::{ws::WebSocket, Path, Query, State, WebSocketUpgrade},
+    headers::Server,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -348,6 +349,47 @@ async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> im
     }
 }
 
+async fn room_by_id(
+    Path(room_id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let room = db::get_room(&state.db_pool, &room_id).await;
+
+    let room = match room {
+        Ok(r) => r,
+        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
+    };
+
+    if let Some(room) = room {
+        ServerResponse::Ok(room)
+    } else {
+        ServerResponse::Err(StatusCode::NOT_FOUND, "room not found".to_string())
+    }
+}
+
+async fn ws_handler(Path(room_id): Path<String>, ws: WebSocketUpgrade) -> Response {
+    println!("New ws request for room: {}", room_id);
+    ws.on_upgrade(handle_socket)
+}
+
+async fn handle_socket(mut socket: WebSocket) {
+    while let Some(msg) = socket.recv().await {
+        let msg = if let Ok(msg) = msg {
+            msg
+        } else {
+            // client disconnected
+            return;
+        };
+
+        println!("{:?}", msg);
+
+        if socket.send(msg).await.is_err() {
+            // client disconnected
+            return;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     db_pool: Pool<Postgres>,
@@ -379,6 +421,8 @@ async fn main() {
         .route("/refresh-token", post(refresh_token))
         .route("/add-room", post(add_room))
         .route("/rooms", get(rooms_by_user))
+        .route("/rooms/:id", get(room_by_id))
+        .route("/rooms/:id/ws", get(ws_handler))
         .layer(cors)
         .with_state(shared_state);
 
