@@ -1,6 +1,8 @@
 use axum::{
-    extract::{ws::WebSocket, Path, Query, State, WebSocketUpgrade},
-    headers::Server,
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, State, WebSocketUpgrade,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -11,12 +13,21 @@ use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+use std::{env, sync::Arc};
+
+use futures::{
+    sink::SinkExt,
+    stream::{SplitSink, SplitStream, StreamExt},
+};
+
+use tokio::sync::broadcast::{self, Receiver, Sender};
 
 use tower_http::cors::CorsLayer;
 
 use sqlx::{Pool, Postgres};
+
+use crate::db::get_room;
 
 mod db;
 mod jwt;
@@ -81,7 +92,7 @@ struct AccessTokenParams {
 }
 
 async fn create_session(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     params: Option<Query<AccessTokenParams>>,
 ) -> impl IntoResponse {
     if let Some(params) = params {
@@ -145,7 +156,7 @@ struct RefreshTokenRequest {
 }
 
 async fn refresh_token(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<RefreshTokenRequest>,
 ) -> impl IntoResponse {
     let token_response = match get_refreshed_token(&state, payload.refresh_token).await {
@@ -307,7 +318,7 @@ struct AddRoomRequest {
 }
 
 async fn add_room(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     claims: jwt::Claims,
     Json(payload): Json<AddRoomRequest>,
 ) -> impl IntoResponse {
@@ -338,7 +349,10 @@ async fn add_room(
     }
 }
 
-async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> impl IntoResponse {
+async fn rooms_by_user(
+    State(state): State<Arc<AppState>>,
+    claims: jwt::Claims,
+) -> impl IntoResponse {
     let user_id = claims.sub;
 
     let rooms = db::get_rooms_by_user(&state.db_pool, &user_id).await;
@@ -351,7 +365,7 @@ async fn rooms_by_user(State(state): State<AppState>, claims: jwt::Claims) -> im
 
 async fn room_by_id(
     Path(room_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let room = db::get_room(&state.db_pool, &room_id).await;
 
@@ -367,35 +381,139 @@ async fn room_by_id(
     }
 }
 
-async fn ws_handler(Path(room_id): Path<String>, ws: WebSocketUpgrade) -> Response {
-    println!("New ws request for room: {}", room_id);
-    ws.on_upgrade(handle_socket)
+struct RoomSockets {
+    pools: Mutex<HashMap<String, RoomPool>>, // key - room id
 }
 
-async fn handle_socket(mut socket: WebSocket) {
-    while let Some(msg) = socket.recv().await {
-        let msg = if let Ok(msg) = msg {
-            msg
-        } else {
-            // client disconnected
-            return;
-        };
-
-        println!("{:?}", msg);
-
-        if socket.send(msg).await.is_err() {
-            // client disconnected
-            return;
+impl RoomSockets {
+    fn new() -> Self {
+        RoomSockets {
+            pools: Mutex::new(HashMap::new()),
         }
     }
 }
 
-#[derive(Clone)]
+struct RoomPool {
+    tx: broadcast::Sender<String>,
+}
+
+async fn ws_handler(
+    Path(room_id): Path<String>,
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    println!("New ws request for room: {}", room_id);
+
+    let room = db::get_room(&state.db_pool, &room_id).await;
+
+    let room = match room {
+        Ok(r) => r,
+        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
+    };
+
+    if let Some(_room) = room {
+        // Check if room has pool existing
+        // If not then add
+        insert_pool(&state, &room_id);
+
+        let _ = ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone()));
+
+        ServerResponse::Ok(())
+    } else {
+        ServerResponse::Err(StatusCode::NOT_FOUND, "room not found".to_string())
+    }
+}
+
+fn insert_pool(state: &AppState, room_id: &str) {
+    let mut locked_pools = state.room_sockets.pools.lock().unwrap();
+
+    if !locked_pools.contains_key(room_id) {
+        let (tx, _rx) = broadcast::channel(100);
+
+        let new_pool = RoomPool { tx };
+
+        locked_pools.insert(room_id.to_owned(), new_pool);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct WsMessage {
+    token: String,
+    track: Track,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Track {
+    id: String,
+    uri: String,
+    name: String,
+    artists: Vec<Artist>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Artist {
+    name: String,
+    uri: String,
+    url: String,
+}
+
+async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String) {
+    let (mut sender, mut receiver) = stream.split();
+
+    let mut rx = get_receiver(&state, &room_id);
+
+    // Spawn the first task that will receive broadcast messages and send text
+    // messages over the websocket to our client.
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            // In any websocket error, break loop.
+            if sender.send(Message::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let tx = get_sender(&state, &room_id);
+
+    // Spawn a task that takes messages from the websocket, prepends the user
+    // name, and sends them to all broadcast subscribers.
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            // Add username before message.
+            let _ = tx.send(format!("meow"));
+        }
+    });
+
+    // If any one of the tasks run to completion, we abort the other.
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
+}
+
+fn get_receiver(state: &AppState, room_id: &str) -> Receiver<String> {
+    let room_map = state.room_sockets.pools.lock().unwrap();
+    let room_pool = room_map.get(room_id).unwrap();
+    let rx = room_pool.tx.subscribe();
+
+    rx
+}
+
+fn get_sender(state: &AppState, room_id: &str) -> Sender<String> {
+    // Clone things we want to pass (move) to the receiving task.
+    let room_map = state.room_sockets.pools.lock().unwrap();
+    let room_pool = room_map.get(room_id).unwrap();
+    let tx = room_pool.tx.clone();
+
+    tx
+}
+
 struct AppState {
     db_pool: Pool<Postgres>,
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    room_sockets: RoomSockets,
 }
 
 #[tokio::main]
@@ -406,12 +524,15 @@ async fn main() {
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
-    let shared_state = AppState {
+    let room_sockets = RoomSockets::new();
+
+    let shared_state = Arc::new(AppState {
         db_pool: pg_db.conn(),
         client_id,
         client_secret,
         redirect_uri,
-    };
+        room_sockets,
+    });
 
     let cors = CorsLayer::permissive();
 
