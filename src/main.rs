@@ -1,4 +1,5 @@
 use axum::{
+    body,
     extract::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
@@ -16,18 +17,13 @@ use serde_json::json;
 use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
 use std::{env, sync::Arc};
 
-use futures::{
-    sink::SinkExt,
-    stream::{SplitSink, SplitStream, StreamExt},
-};
+use futures::{sink::SinkExt, stream::StreamExt};
 
 use tokio::sync::broadcast::{self, Receiver, Sender};
 
 use tower_http::cors::CorsLayer;
 
 use sqlx::{Pool, Postgres};
-
-use crate::db::get_room;
 
 mod db;
 mod jwt;
@@ -408,19 +404,23 @@ async fn ws_handler(
 
     let room = match room {
         Ok(r) => r,
-        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(body::boxed(body::Empty::new()))
+                .unwrap()
+        }
     };
 
     if let Some(_room) = room {
-        // Check if room has pool existing
-        // If not then add
         insert_pool(&state, &room_id);
 
-        let _ = ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone()));
-
-        ServerResponse::Ok(())
+        ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone()))
     } else {
-        ServerResponse::Err(StatusCode::NOT_FOUND, "room not found".to_string())
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(body::boxed(body::Empty::new()))
+            .unwrap()
     }
 }
 
@@ -480,7 +480,7 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String)
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             // Add username before message.
-            let _ = tx.send(format!("meow"));
+            let _ = tx.send(text);
         }
     });
 
