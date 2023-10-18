@@ -393,12 +393,35 @@ struct RoomPool {
     tx: broadcast::Sender<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct WsParams {
+    access_token: String,
+}
+
 async fn ws_handler(
     Path(room_id): Path<String>,
+    params: Query<WsParams>,
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    println!("New ws request for room: {}", room_id);
+    println!(
+        "New ws request for room: {}, token: {}",
+        room_id, params.access_token
+    );
+
+    let claims = match jwt::decode_jwt(&params.access_token) {
+        Ok(claims) => claims,
+        Err(e) => {
+            println!("Claims decode error: {:?}", e);
+
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(body::boxed(body::Empty::new()))
+                .unwrap();
+        }
+    };
+
+    let user_id = claims.sub;
 
     let room = db::get_room(&state.db_pool, &room_id).await;
 
@@ -415,7 +438,7 @@ async fn ws_handler(
     if let Some(_room) = room {
         insert_pool(&state, &room_id);
 
-        ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone()))
+        ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone(), user_id))
     } else {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -438,8 +461,8 @@ fn insert_pool(state: &AppState, room_id: &str) {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct WsMessage {
-    token: String,
     track: Track,
+    user_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -457,7 +480,7 @@ struct Artist {
     url: String,
 }
 
-async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String) {
+async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String, user_id: String) {
     let (mut sender, mut receiver) = stream.split();
 
     let mut rx = get_receiver(&state, &room_id);
@@ -475,12 +498,14 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String)
 
     let tx = get_sender(&state, &room_id);
 
-    // Spawn a task that takes messages from the websocket, prepends the user
-    // name, and sends them to all broadcast subscribers.
+    // Spawn a task that takes messages from the websocket and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            // Add username before message.
-            let _ = tx.send(text);
+            let deserialized: Result<WsMessage, serde_json::Error> = serde_json::from_str(&text);
+            let mut msg = deserialized.unwrap();
+            msg.user_id = Some(user_id.clone());
+            let serialized = serde_json::to_string(&msg).unwrap();
+            let _ = tx.send(serialized);
         }
     });
 
