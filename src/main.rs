@@ -14,7 +14,11 @@ use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Mutex,
+};
 use std::{env, sync::Arc};
 
 use futures::{sink::SinkExt, stream::StreamExt};
@@ -377,20 +381,32 @@ async fn room_by_id(
     }
 }
 
-struct RoomSockets {
-    pools: Mutex<HashMap<String, RoomPool>>, // key - room id
+struct ConnectedRooms {
+    rooms: Mutex<HashMap<String, Room>>, // key - room id
 }
 
-impl RoomSockets {
+impl ConnectedRooms {
     fn new() -> Self {
-        RoomSockets {
-            pools: Mutex::new(HashMap::new()),
+        ConnectedRooms {
+            rooms: Mutex::new(HashMap::new()),
         }
     }
 }
 
-struct RoomPool {
+struct Room {
     tx: broadcast::Sender<String>,
+    tracks: Mutex<HashMap<String, Track>>,
+    users: Mutex<HashSet<String>>,
+}
+
+impl Room {
+    fn new(tx: broadcast::Sender<String>) -> Self {
+        Room {
+            tx,
+            tracks: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashSet::new()),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -423,6 +439,20 @@ async fn ws_handler(
 
     let user_id = claims.sub;
 
+    let user = db::get_user(&state.db_pool, &user_id).await;
+
+    let user = match user {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(body::boxed(body::Empty::new()))
+                .unwrap()
+        }
+    };
+
+    let user = user.unwrap();
+
     let room = db::get_room(&state.db_pool, &room_id).await;
 
     let room = match room {
@@ -438,7 +468,7 @@ async fn ws_handler(
     if let Some(_room) = room {
         insert_pool(&state, &room_id);
 
-        ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone(), user_id))
+        ws.on_upgrade(move |socket| handle_socket(socket, state, room_id.clone(), user))
     } else {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -448,12 +478,12 @@ async fn ws_handler(
 }
 
 fn insert_pool(state: &AppState, room_id: &str) {
-    let mut locked_pools = state.room_sockets.pools.lock().unwrap();
+    let mut locked_pools = state.connected.rooms.lock().unwrap();
 
     if !locked_pools.contains_key(room_id) {
         let (tx, _rx) = broadcast::channel(100);
 
-        let new_pool = RoomPool { tx };
+        let new_pool = Room::new(tx);
 
         locked_pools.insert(room_id.to_owned(), new_pool);
     }
@@ -465,22 +495,38 @@ struct WsMessage {
     user_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Track {
     id: String,
     uri: String,
     name: String,
     artists: Vec<Artist>,
+    album: Album,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Album {
+    images: Vec<AlbumImage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct AlbumImage {
+    url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Artist {
     name: String,
     uri: String,
     url: String,
 }
 
-async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String, user_id: String) {
+async fn handle_socket(
+    stream: WebSocket,
+    state: Arc<AppState>,
+    room_id: String,
+    user: db::SpotifyUser,
+) {
     let (mut sender, mut receiver) = stream.split();
 
     let mut rx = get_receiver(&state, &room_id);
@@ -498,13 +544,17 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String,
 
     let tx = get_sender(&state, &room_id);
 
+    let user_id = user.id.unwrap().to_string();
+
     // Spawn a task that takes messages from the websocket and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             let deserialized: Result<WsMessage, serde_json::Error> = serde_json::from_str(&text);
             let mut msg = deserialized.unwrap();
             msg.user_id = Some(user_id.clone());
-            let serialized = serde_json::to_string(&msg).unwrap();
+            update_room(&state, &room_id, &user.display_name, &msg.track);
+            let room_data = get_room(&state, &room_id);
+            let serialized = serde_json::to_string(&room_data).unwrap();
             let _ = tx.send(serialized);
         }
     });
@@ -517,7 +567,7 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>, room_id: String,
 }
 
 fn get_receiver(state: &AppState, room_id: &str) -> Receiver<String> {
-    let room_map = state.room_sockets.pools.lock().unwrap();
+    let room_map = state.connected.rooms.lock().unwrap();
     let room_pool = room_map.get(room_id).unwrap();
     let rx = room_pool.tx.subscribe();
 
@@ -526,11 +576,35 @@ fn get_receiver(state: &AppState, room_id: &str) -> Receiver<String> {
 
 fn get_sender(state: &AppState, room_id: &str) -> Sender<String> {
     // Clone things we want to pass (move) to the receiving task.
-    let room_map = state.room_sockets.pools.lock().unwrap();
+    let room_map = state.connected.rooms.lock().unwrap();
     let room_pool = room_map.get(room_id).unwrap();
     let tx = room_pool.tx.clone();
 
     tx
+}
+
+fn update_room(state: &AppState, room_id: &str, display_name: &str, track: &Track) {
+    let room_map = state.connected.rooms.lock().unwrap();
+    let room = room_map.get(room_id).unwrap();
+
+    room.tracks
+        .lock()
+        .unwrap()
+        .insert(display_name.to_string(), track.clone());
+}
+
+fn get_room(state: &AppState, room_id: &str) -> HashMap<String, Track> {
+    let room_map = state.connected.rooms.lock().unwrap();
+
+    let tracks = room_map
+        .get(room_id)
+        .unwrap()
+        .tracks
+        .lock()
+        .unwrap()
+        .clone();
+
+    tracks
 }
 
 struct AppState {
@@ -538,7 +612,7 @@ struct AppState {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
-    room_sockets: RoomSockets,
+    connected: ConnectedRooms,
 }
 
 #[tokio::main]
@@ -549,14 +623,14 @@ async fn main() {
     let client_secret = env::var("CLIENT_SECRET").unwrap();
     let redirect_uri = env::var("REDIRECT_URI").unwrap();
 
-    let room_sockets = RoomSockets::new();
+    let connected = ConnectedRooms::new();
 
     let shared_state = Arc::new(AppState {
         db_pool: pg_db.conn(),
         client_id,
         client_secret,
         redirect_uri,
-        room_sockets,
+        connected,
     });
 
     let cors = CorsLayer::permissive();

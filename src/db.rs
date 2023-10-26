@@ -62,14 +62,14 @@ pub async fn create_user(
     user: &SpotifyUserProfile,
 ) -> Result<SpotifyUser, sqlx::Error> {
     let spotify_id = user.id.clone();
-    let existing_result = get_user(pool, &spotify_id).await?;
+    let existing_result = get_user_with_spotify_id(pool, &spotify_id).await?;
 
     let user_res = match existing_result {
         Some(user) => return Ok(user),
         None => {
             insert_user(pool, &spotify_id, &user.display_name).await?;
 
-            let user_res = get_user(pool, &spotify_id).await?;
+            let user_res = get_user_with_spotify_id(pool, &spotify_id).await?;
             if let Some(u) = user_res {
                 Ok(u)
             } else {
@@ -81,7 +81,34 @@ pub async fn create_user(
     user_res
 }
 
-async fn get_user(
+pub async fn get_user(pool: &sqlx::Pool<Postgres>, id: &str) -> Result<Option<SpotifyUser>, DbErr> {
+    let uuid = parse_uuid(id);
+
+    let uuid = match uuid {
+        Ok(id) => id,
+        Err(e) => return Err(DbErr::Uuid(e)),
+    };
+
+    let res = sqlx::query_as::<_, SpotifyUser>("SELECT * FROM spotify_user WHERE id = $1")
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await;
+
+    let user = match res {
+        Ok(user_opt) => user_opt,
+        Err(e) => return Err(DbErr::Call(e)),
+    };
+
+    if let Some(user) = user {
+        println!("Found user: {:?}", user);
+        Ok(Some(user))
+    } else {
+        println!("Didn't find user with id: {}", id);
+        Ok(None)
+    }
+}
+
+async fn get_user_with_spotify_id(
     pool: &sqlx::Pool<Postgres>,
     spotify_user_id: &str,
 ) -> Result<Option<SpotifyUser>, sqlx::Error> {
