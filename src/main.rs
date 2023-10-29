@@ -9,28 +9,27 @@ use axum::{
     Json, Router,
 };
 
-use base64::{engine::general_purpose, Engine as _};
-use hyper::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use hyper::StatusCode;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
 use std::{
     collections::{HashMap, HashSet},
+    env,
     net::SocketAddr,
+    sync::Arc,
     sync::Mutex,
 };
-use std::{env, sync::Arc};
 
 use futures::{sink::SinkExt, stream::StreamExt};
-
-use tokio::sync::broadcast::{self, Receiver, Sender};
-
-use tower_http::cors::CorsLayer;
-
 use sqlx::{Pool, Postgres};
+use tokio::sync::broadcast::{self, Receiver, Sender};
+use tower_http::cors::CorsLayer;
 
 mod db;
 mod jwt;
+mod spotify;
 
 enum ServerResponse<T> {
     Ok(T),
@@ -51,38 +50,8 @@ where
     }
 }
 
-enum ParseError {
-    Err(String),
-}
-
-impl ParseError {
-    fn msg(self) -> String {
-        match self {
-            ParseError::Err(e) => e,
-        }
-    }
-}
-
 async fn root() -> &'static str {
     "Hello, World!"
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SpotifyAccessTokenResponse {
-    access_token: String,
-    token_type: String,
-    scope: String,
-    expires_in: i32,
-    refresh_token: String,
-    session: Option<String>, // added in the api
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct SpotifyRefreshedAccessTokenResponse {
-    access_token: String,
-    token_type: String,
-    scope: String,
-    expires_in: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -98,18 +67,20 @@ async fn create_session(
     if let Some(params) = params {
         let params: AccessTokenParams = params.0;
 
-        let mut token_response = match get_tokens(&state, params).await {
-            Ok(response) => match get_token_body(response).await {
-                Ok(token_res) => token_res,
-                Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
-            },
-            Err(err) => {
-                return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-            }
+        let token_result = spotify::get_token_response(
+            &state.client_id,
+            &state.client_secret,
+            &state.redirect_uri,
+            &params.code,
+        )
+        .await;
+
+        let mut token_response = match token_result {
+            Ok(res) => res,
+            Err(err) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.msg()),
         };
 
-        // Get user information with the new access token and save profile data
-        let user_info = get_user_info(token_response.access_token.to_owned()).await;
+        let user_info = spotify::get_user_info(&token_response).await;
         let user_info = match user_info {
             Ok(info) => info,
             Err(err) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, err.msg()),
@@ -118,12 +89,13 @@ async fn create_session(
         // check if user exists, if not then create
         let user_db_response: Result<db::SpotifyUser, sqlx::Error> =
             db::create_user(&state.db_pool, &user_info).await;
+
         let user = match user_db_response {
             Ok(u) => u,
             Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
 
-        let token_result = generate_jwt(&user);
+        let token_result = jwt::generate_jwt(&user);
         let token = match token_result {
             Ok(t) => t,
             Err(e) => {
@@ -140,16 +112,6 @@ async fn create_session(
     }
 }
 
-fn generate_jwt(user: &db::SpotifyUser) -> Result<String, jwt::AuthError> {
-    let claims = jwt::Claims {
-        sub: user.id.unwrap().to_string(),
-        display_name: user.display_name.to_string(),
-        exp: 2000000000,
-    };
-
-    jwt::encode_claims(claims)
-}
-
 #[derive(Deserialize)]
 struct RefreshTokenRequest {
     refresh_token: String,
@@ -159,157 +121,17 @@ async fn refresh_token(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RefreshTokenRequest>,
 ) -> impl IntoResponse {
-    let token_response = match get_refreshed_token(&state, payload.refresh_token).await {
-        Ok(res) => match get_refreshed_token_body(res).await {
-            Ok(res) => res,
-            Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
-        },
-        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    let token_response = spotify::get_refreshed_token(
+        &state.client_id,
+        &state.client_secret,
+        &payload.refresh_token,
+    )
+    .await;
 
-    ServerResponse::Ok(token_response)
-}
-
-async fn get_tokens(
-    state: &AppState,
-    params: AccessTokenParams,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let url = "https://accounts.spotify.com/api/token";
-
-    let client_id = &state.client_id;
-    let client_secret = &state.client_secret;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        get_hashed_header(&client_id, &client_secret)
-            .parse()
-            .unwrap(),
-    );
-
-    let redirect_uri = &state.redirect_uri;
-
-    let mut form_params = HashMap::new();
-    form_params.insert("grant_type", "authorization_code");
-    form_params.insert("code", &params.code);
-    form_params.insert("redirect_uri", &redirect_uri);
-
-    let client = reqwest::Client::new();
-
-    client
-        .post(url)
-        .headers(headers)
-        .form(&form_params)
-        .send()
-        .await
-}
-
-async fn get_token_body(
-    response: reqwest::Response,
-) -> Result<SpotifyAccessTokenResponse, ParseError> {
-    let body = match response.text().await {
-        Ok(b) => b,
-        Err(e) => return Err(ParseError::Err(e.to_string())),
-    };
-
-    let deserialized: Result<SpotifyAccessTokenResponse, serde_json::Error> =
-        serde_json::from_str(&body);
-
-    match deserialized {
-        Ok(res) => Ok(res),
-        Err(err) => Err(ParseError::Err(err.to_string())),
+    match token_response {
+        Ok(res) => ServerResponse::Ok(res),
+        Err(e) => return ServerResponse::Err(StatusCode::INTERNAL_SERVER_ERROR, e.msg()),
     }
-}
-
-async fn get_refreshed_token(
-    state: &AppState,
-    refresh_token: String,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let url = "https://accounts.spotify.com/api/token";
-
-    let client_id = &state.client_id;
-    let client_secret = &state.client_secret;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        get_hashed_header(&client_id, &client_secret)
-            .parse()
-            .unwrap(),
-    );
-
-    let mut form_params = HashMap::new();
-    form_params.insert("grant_type", "refresh_token");
-    form_params.insert("refresh_token", &refresh_token);
-
-    let client = reqwest::Client::new();
-
-    client
-        .post(url)
-        .headers(headers)
-        .form(&form_params)
-        .send()
-        .await
-}
-
-async fn get_refreshed_token_body(
-    response: reqwest::Response,
-) -> Result<SpotifyRefreshedAccessTokenResponse, ParseError> {
-    let body = match response.text().await {
-        Ok(b) => b,
-        Err(e) => return Err(ParseError::Err(e.to_string())),
-    };
-
-    let deserialized: Result<SpotifyRefreshedAccessTokenResponse, serde_json::Error> =
-        serde_json::from_str(&body);
-
-    match deserialized {
-        Ok(res) => Ok(res),
-        Err(err) => Err(ParseError::Err(err.to_string())),
-    }
-}
-
-fn get_hashed_header(client_id: &str, client_secret: &str) -> String {
-    let plain = format!("{}:{}", client_id, client_secret);
-    let base64_encoded = general_purpose::STANDARD_NO_PAD.encode(plain.as_bytes());
-    format!("Basic {}", base64_encoded)
-}
-
-async fn get_user_info(token: String) -> Result<SpotifyUserProfile, ParseError> {
-    let url = "https://api.spotify.com/v1/me";
-
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
-
-    let client = reqwest::Client::new();
-
-    let result = client.get(url).headers(headers).send().await;
-
-    let body = match result {
-        Ok(res) => match res.text().await {
-            Ok(body) => body,
-            Err(err) => return Err(ParseError::Err(err.to_string())),
-        },
-        Err(err) => return Err(ParseError::Err(err.to_string())),
-    };
-
-    let parse_result: Result<SpotifyUserProfile, serde_json::Error> = serde_json::from_str(&body);
-
-    match parse_result {
-        Ok(profile) => {
-            println!("{:?}", profile);
-            Ok(profile)
-        }
-        Err(err) => Err(ParseError::Err(err.to_string())),
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct SpotifyUserProfile {
-    country: String,
-    display_name: String,
-    email: String,
-    id: String,
 }
 
 #[derive(Deserialize)]

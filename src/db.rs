@@ -1,4 +1,4 @@
-use crate::SpotifyUserProfile;
+use crate::spotify;
 use serde::Serialize;
 use sqlx::types::uuid;
 use sqlx::types::uuid::Uuid;
@@ -59,7 +59,7 @@ impl DbErr {
 
 pub async fn create_user(
     pool: &sqlx::Pool<Postgres>,
-    user: &SpotifyUserProfile,
+    user: &spotify::SpotifyUserProfile,
 ) -> Result<SpotifyUser, sqlx::Error> {
     let spotify_id = user.id.clone();
     let existing_result = get_user_with_spotify_id(pool, &spotify_id).await?;
