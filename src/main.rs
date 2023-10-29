@@ -262,7 +262,6 @@ async fn ws_handler(
     let user_id = claims.sub;
 
     let user = db::get_user(&state.db_pool, &user_id).await;
-
     let user = match user {
         Ok(u) => u,
         Err(e) => {
@@ -276,7 +275,6 @@ async fn ws_handler(
     let user = user.unwrap();
 
     let room = db::get_room(&state.db_pool, &room_id).await;
-
     let room = match room {
         Ok(r) => r,
         Err(e) => {
@@ -368,14 +366,25 @@ async fn handle_socket(
 
     let user_id = user.id.unwrap().to_string();
 
+    let state_clone = state.clone();
+    let room_id_clone = room_id.clone();
+    let user_clone = user.clone();
+
     // Spawn a task that takes messages from the websocket and sends them to all broadcast subscribers.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             let deserialized: Result<WsMessage, serde_json::Error> = serde_json::from_str(&text);
             let mut msg = deserialized.unwrap();
+
             msg.user_id = Some(user_id.clone());
-            update_room(&state, &room_id, &user.display_name, &msg.track);
-            let room_data = get_room(&state, &room_id);
+
+            update_room(
+                &state_clone,
+                &room_id_clone,
+                &user_clone.display_name,
+                &msg.track,
+            );
+            let room_data = get_room(&state_clone, &room_id_clone);
             let serialized = serde_json::to_string(&room_data).unwrap();
             let _ = tx.send(serialized);
         }
@@ -386,6 +395,8 @@ async fn handle_socket(
         _ = (&mut send_task) => recv_task.abort(),
         _ = (&mut recv_task) => send_task.abort(),
     };
+
+    remove_user_from_room(&state, &room_id, &user.display_name)
 }
 
 fn get_receiver(state: &AppState, room_id: &str) -> Receiver<String> {
@@ -413,6 +424,17 @@ fn update_room(state: &AppState, room_id: &str, display_name: &str, track: &Trac
         .lock()
         .unwrap()
         .insert(display_name.to_string(), track.clone());
+
+    println!("User {} added to room: {}", display_name, room_id);
+}
+
+fn remove_user_from_room(state: &AppState, room_id: &str, display_name: &str) {
+    let room_map = state.connected.rooms.lock().unwrap();
+    let room = room_map.get(room_id).unwrap();
+
+    room.tracks.lock().unwrap().remove(display_name);
+
+    println!("User {} removed from room: {}", display_name, room_id);
 }
 
 fn get_room(state: &AppState, room_id: &str) -> HashMap<String, Track> {

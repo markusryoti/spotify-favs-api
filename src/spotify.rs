@@ -31,11 +31,6 @@ pub struct SpotifyUserProfile {
     pub id: String,
 }
 
-#[derive(Deserialize)]
-struct RefreshTokenRequest {
-    refresh_token: String,
-}
-
 pub enum ParseError {
     Err(String),
 }

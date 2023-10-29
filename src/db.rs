@@ -26,7 +26,7 @@ impl Client {
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub struct SpotifyUser {
     pub id: Option<Uuid>,
     pub spotify_user_id: String,
