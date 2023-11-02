@@ -337,8 +337,6 @@ struct AlbumImage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Artist {
     name: String,
-    uri: String,
-    url: String,
 }
 
 async fn handle_socket(
@@ -384,6 +382,7 @@ async fn handle_socket(
                 &user_clone.display_name,
                 &msg.track,
             );
+
             let room_data = get_room(&state_clone, &room_id_clone);
             let serialized = serde_json::to_string(&room_data).unwrap();
             let _ = tx.send(serialized);
